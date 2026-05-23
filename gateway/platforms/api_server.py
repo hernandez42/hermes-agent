@@ -710,7 +710,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if not origin or not self._cors_origins:
             return None
 
-        if "*" in self._cors_origins:
+        if "*" in self._cors_origins and os.getenv("API_SERVER_ALLOW_ANY_ORIGIN", "").lower() in ("1", "true"):
             headers = dict(_CORS_HEADERS)
             headers["Access-Control-Allow-Origin"] = "*"
             headers["Access-Control-Max-Age"] = "600"
