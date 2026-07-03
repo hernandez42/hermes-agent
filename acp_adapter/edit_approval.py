@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import tempfile
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextvars import ContextVar, Token
@@ -127,22 +128,121 @@ def _proposal_for_patch_replace(arguments: dict[str, Any]) -> EditProposal:
     )
 
 
+def _extract_v4a_patch_paths(patch_body: str) -> list[str]:
+    paths: list[str] = []
+    for match in re.finditer(
+        r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$',
+        patch_body,
+        re.MULTILINE,
+    ):
+        path = match.group(1).strip()
+        if path:
+            paths.append(path)
+    for match in re.finditer(
+        r'^\*\*\*\s+Move\s+File:\s*(.+?)\s*->\s*(.+)$',
+        patch_body,
+        re.MULTILINE,
+    ):
+        src = match.group(1).strip()
+        dst = match.group(2).strip()
+        if src:
+            paths.append(src)
+        if dst:
+            paths.append(dst)
+    return paths
+
+
+def _proposal_for_patch_v4a(arguments: dict[str, Any]) -> EditProposal:
+    patch_body = arguments.get("patch")
+    if not isinstance(patch_body, str) or not patch_body:
+        raise ValueError("patch content required")
+
+    paths = _extract_v4a_patch_paths(patch_body)
+    if not paths:
+        raise ValueError("no file paths found in V4A patch")
+
+    proposal_path = paths[0] if len(paths) == 1 else ", ".join(paths)
+    old_text = _read_text_if_exists(paths[0]) if len(paths) == 1 else None
+    return EditProposal(
+        tool_name="patch",
+        path=proposal_path,
+        old_text=old_text,
+        # ACP only supports a single diff payload here.  Surface the exact V4A
+        # patch content before execution so patch-mode calls are permissioned
+        # and denied patches cannot mutate.
+        new_text=patch_body,
+        arguments=dict(arguments),
+    )
+
+
 def build_edit_proposal(tool_name: str, arguments: dict[str, Any]) -> EditProposal | None:
     """Return an edit proposal for supported file mutation calls."""
 
     if tool_name == "write_file":
         return _proposal_for_write_file(arguments)
-    if tool_name == "patch" and arguments.get("mode", "replace") == "replace":
-        return _proposal_for_patch_replace(arguments)
+    if tool_name == "patch":
+        mode = arguments.get("mode", "replace")
+        if mode == "replace":
+            return _proposal_for_patch_replace(arguments)
+        if mode == "patch":
+            return _proposal_for_patch_v4a(arguments)
     return None
 
 
+# Symlink-aware sensitive-path check. The original implementation only
+# inspected the literal path string and could be bypassed by an
+# innocuously-named symlink whose target was a credential file (#55367).
+_SENSITIVE_AUTO_APPROVE_DIR_NAMES = frozenset({".git", ".ssh"})
+
+
 def _is_sensitive_auto_approve_path(path: str) -> bool:
-    parts = Path(path).expanduser().parts
-    lowered = {part.lower() for part in parts}
-    if ".git" in lowered or ".ssh" in lowered:
+    """Return True if `path` (literal or symlink-resolved) is sensitive.
+
+    A path is sensitive if either:
+
+      * its literal string names a sensitive segment (e.g. ``.ssh``)
+        or sensitive basename (e.g. ``id_rsa``), OR
+      * the path resolves — through any chain of symlinks — to a
+        location whose segments or basename are sensitive.
+
+    The second check closes the bypass in #55367: an edit whose path
+    string is ``project/notes.txt`` but where ``notes.txt`` is a
+    symlink to ``~/.ssh/authorized_keys`` would otherwise be
+    auto-approved under the ``session`` policy and write to the
+    credential file with no prompt.
+
+    Failure modes:
+
+      * Path cannot be resolved (broken symlink chain, EACCES, ENOENT
+        on an intermediate directory): the literal-path result is
+        authoritative. We do not have enough information to decide
+        whether the symlink would have pointed at something sensitive.
+      * Path does not yet exist (write_file creating a new file):
+        ``resolve(strict=False)`` returns the canonical absolute path
+        with no symlink to follow. The literal-path check still applies.
+    """
+    p = Path(path).expanduser()
+
+    # Literal-path check first (cheap, no FS access). Catches paths like
+    # `~/.ssh/authorized_keys` directly.
+    literal_parts = {part.lower() for part in p.parts}
+    if literal_parts & _SENSITIVE_AUTO_APPROVE_DIR_NAMES:
         return True
-    return Path(path).name.lower() in SENSITIVE_AUTO_APPROVE_NAMES
+    if p.name.lower() in SENSITIVE_AUTO_APPROVE_NAMES:
+        return True
+
+    # Symlink-resolved check (catches #55367). Resolve to canonical
+    # path even if the file does not yet exist (strict=False).
+    try:
+        resolved = p.resolve(strict=False)
+    except OSError:
+        return False
+    resolved_parts = {part.lower() for part in resolved.parts}
+    if resolved_parts & _SENSITIVE_AUTO_APPROVE_DIR_NAMES:
+        return True
+    if resolved.name.lower() in SENSITIVE_AUTO_APPROVE_NAMES:
+        return True
+    return False
 
 
 def should_auto_approve_edit(proposal: EditProposal, policy: str, cwd: str | None = None) -> bool:
